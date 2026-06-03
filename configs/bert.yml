@@ -1,0 +1,53 @@
+# BERT Inference Configuration
+# Target: AMD MI300X with ROCm
+
+model:
+  name: bert-base-uncased
+  path: models/bert-base-uncased.onnx
+  domain: nlp
+
+inference:
+  providers:
+    - ROCMExecutionProvider
+    - CPUExecutionProvider
+  device_id: 0
+  graph_optimization: ORT_ENABLE_ALL
+  thread_count: 2
+  execution_mode: ORT_SEQUENTIAL
+
+benchmark:
+  warmup_iterations: 50
+  measured_iterations: 500
+  batch_sizes: [1, 4, 8, 16]
+
+input:
+  shapes:
+    input_ids: [1, 128]
+    attention_mask: [1, 128]
+    token_type_ids: [1, 128]
+  dtype: int64
+
+tokenization:
+  tokenizer: bert-base-uncased
+  max_length: 512
+  padding: max_length
+  truncation: true
+
+tasks:
+  - name: question_answering
+    type: qa
+    labels_file: null
+  - name: text_classification
+    type: classification
+    num_labels: 2
+
+optimization:
+  constant_folding: true
+  node_fusion: true
+  qdq_quantization: false
+  fp16_conversion: true
+
+profiling:
+  enabled: false
+  output_dir: profiles/bert/
+  export_chrome_trace: true

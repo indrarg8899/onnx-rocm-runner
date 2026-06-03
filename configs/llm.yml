@@ -1,0 +1,71 @@
+# Large Language Model Inference Configuration
+# Target: AMD MI300X (192GB HBM3) with ROCm
+
+model:
+  name: llama-7b-onnx
+  path: models/llama-7b-int4.onnx
+  domain: llm
+  quantization: int4_awq
+
+inference:
+  providers:
+    - ROCMExecutionProvider
+  device_id: 0
+  graph_optimization: ORT_ENABLE_ALL
+  thread_count: 1
+  execution_mode: ORT_SEQUENTIAL
+  memory_limit: 0  # Use full HBM
+
+benchmark:
+  warmup_iterations: 20
+  measured_iterations: 100
+  batch_sizes: [1]
+  sequence_lengths: [128, 256, 512, 1024, 2048, 4096]
+
+input:
+  shapes:
+    input_ids: [1, -1]  # Dynamic sequence length
+    attention_mask: [1, -1]
+  dtype: int64
+  dynamic_axes:
+    input_ids: {1: "sequence_length"}
+    attention_mask: {1: "sequence_length"}
+
+generation:
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 50
+  repetition_penalty: 1.1
+  do_sample: true
+  eos_token_id: 2  # </s>
+  pad_token_id: 0
+
+kv_cache:
+  enabled: true
+  max_cache_size: 4096
+  dtype: float16
+
+quantization:
+  method: awq_int4
+  bits: 4
+  group_size: 128
+  zero_point: true
+
+optimization:
+  constant_folding: true
+  node_fusion: true
+  flash_attention: true
+  fp16_conversion: true
+  rotary_embedding: true
+
+profiling:
+  enabled: false
+  output_dir: profiles/llm/
+  export_chrome_trace: true
+  export_flame_graph: true
+
+memory:
+  enable_zero_copy: true
+  preallocate_kv_cache: true
+  memory_pool_growth: kNextPowerOfTwo

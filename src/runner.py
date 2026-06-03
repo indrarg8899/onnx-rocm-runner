@@ -1,123 +1,231 @@
 """
-ONNX Runtime inference runner for AMD ROCm GPUs.
+ONNX Runtime ROCm Inference Runner.
 
-Provides optimized inference with ROCm execution provider,
-dynamic batching, and profiling support.
+Main entry point for running ONNX model inference on AMD ROCm GPUs.
 """
 
+from __future__ import annotations
+
+import logging
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-import onnxruntime as ort
+import yaml
+
+from .session import ROCmSessionManager, SessionConfig
+from .benchmark import BenchmarkSuite
+from .models import ModelZoo
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class InferenceResult:
+    """Container for a single inference result."""
+    output: Any
+    latency_ms: float
+    input_shapes: Dict[str, List[int]]
+    output_shapes: Dict[str, List[int]]
+    provider: str = "ROCMExecutionProvider"
+
+
+@dataclass
+class RunnerConfig:
+    """Configuration for the inference runner."""
+    model_path: str
+    providers: List[str] = field(default_factory=lambda: ["ROCMExecutionProvider"])
+    device_id: int = 0
+    graph_optimization: str = "ORT_ENABLE_ALL"
+    thread_count: int = 1
+    memory_limit: int = 0  # 0 = unlimited
+    arena_extend_strategy: str = "kNextPowerOfTwo"
+    enable_profiling: bool = False
+    input_feed: Optional[Dict[str, Any]] = None
+    num_warmup: int = 10
+    num_iterations: int = 100
+
+    @classmethod
+    def from_yaml(cls, path: Union[str, Path]) -> RunnerConfig:
+        """Load configuration from YAML file."""
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> RunnerConfig:
+        """Create config from dictionary."""
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
 class ONNXRunner:
-    """ONNX Runtime runner with ROCm execution provider support."""
+    """
+    High-performance ONNX Runtime inference runner for AMD ROCm.
 
-    DEFAULT_PROVIDERS = [
-        ("ROCMExecutionProvider", {"device_id": 0, "arena_extend_strategy": "kNextPowerOfTwo"}),
-        "CPUExecutionProvider",
-    ]
+    Supports batch inference, streaming, dynamic shapes, and
+    deep profiling integration.
+    """
 
-    def __init__(
-        self,
-        model_path: str,
-        execution_provider: Union[str, list[str]] = "ROCMExecutionProvider",
-        device_id: int = 0,
-        num_threads: int = 4,
-        graph_optimization: str = "ORT_ENABLE_ALL",
-    ):
-        self.model_path = model_path
-        self.device_id = device_id
-        self._stats = {"total_runs": 0, "total_time_ms": 0.0}
+    def __init__(self, config: RunnerConfig):
+        self.config = config
+        self._session: Optional[Any] = None
+        self._input_names: List[str] = []
+        self._output_names: List[str] = []
+        self._session_mgr: Optional[ROCmSessionManager] = None
+        self._model_zoo = ModelZoo()
+        self._warmup_done = False
 
-        providers = self._build_providers(execution_provider, device_id)
+    def load(self) -> "ONNXRunner":
+        """Load the ONNX model and create inference session."""
+        model_path = self._resolve_model(self.config.model_path)
 
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = getattr(
-            ort.GraphOptimizationLevel, graph_optimization, ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        session_config = SessionConfig(
+            providers=self.config.providers,
+            device_id=self.config.device_id,
+            graph_optimization_level=self.config.graph_optimization,
+            thread_count=self.config.thread_count,
+            memory_limit=self.config.memory_limit,
+            arena_extend_strategy=self.config.arena_extend_strategy,
+            enable_profiling=self.config.enable_profiling,
         )
-        sess_options.intra_op_num_threads = num_threads
-        sess_options.inter_op_num_threads = num_threads
 
-        self.session = ort.InferenceSession(model_path, sess_options, providers=providers)
-        self.input_names = [inp.name for inp in self.session.get_inputs()]
-        self.output_names = [out.name for out in self.session.get_outputs()]
+        self._session_mgr = ROCmSessionManager(session_config)
+        self._session = self._session_mgr.create_session(str(model_path))
 
-    def _build_providers(
-        self, provider: Union[str, list[str]], device_id: int
-    ) -> list:
-        """Build execution provider list."""
-        if isinstance(provider, str):
-            return [
-                (provider, {"device_id": device_id}),
-                "CPUExecutionProvider",
-            ]
-        return provider
+        self._input_names = [inp.name for inp in self._session.get_inputs()]
+        self._output_names = [out.name for out in self._session.get_outputs()]
 
-    @property
-    def provider(self) -> str:
-        """Current active execution provider."""
-        return self.session.get_providers()[0]
+        logger.info(
+            "Model loaded: %s (inputs=%d, outputs=%d)",
+            model_path.name,
+            len(self._input_names),
+            len(self._output_names),
+        )
+        return self
 
-    def run(
+    def _resolve_model(self, path: str) -> Path:
+        """Resolve model path — download from zoo if needed."""
+        p = Path(path)
+        if p.exists():
+            return p
+        # Try model zoo
+        model_path = self._model_zoo.download(path)
+        if model_path:
+            return Path(model_path)
+        raise FileNotFoundError(f"Model not found: {path}")
+
+    def predict(
         self,
-        input_data: dict[str, np.ndarray],
-        run_options: Optional[ort.RunOptions] = None,
-    ) -> dict[str, np.ndarray]:
-        """Run inference on a single input."""
+        input_feed: Optional[Dict[str, np.ndarray]] = None,
+    ) -> InferenceResult:
+        """Run single inference and return result with timing."""
+        if self._session is None:
+            raise RuntimeError("Call load() before predict()")
+
+        feed = input_feed or self.config.input_feed
+        if feed is None:
+            raise ValueError("No input_feed provided")
+
         start = time.perf_counter()
-        outputs = self.session.run(self.output_names, input_data, run_options)
-        elapsed = (time.perf_counter() - start) * 1000
+        outputs = self._session.run(self._output_names, feed)
+        latency_ms = (time.perf_counter() - start) * 1000
 
-        self._stats["total_runs"] += 1
-        self._stats["total_time_ms"] += elapsed
+        result_output = outputs[0] if len(outputs) == 1 else outputs
 
-        return dict(zip(self.output_names, outputs))
+        return InferenceResult(
+            output=result_output,
+            latency_ms=latency_ms,
+            input_shapes={k: list(v.shape) for k, v in feed.items()},
+            output_shapes={},
+            provider=self.config.providers[0],
+        )
 
-    def run_batch(
+    def predict_batch(
         self,
-        batch_inputs: list[dict[str, np.ndarray]],
-        batch_size: int = 1,
-    ) -> list[dict[str, np.ndarray]]:
+        input_feed: List[Dict[str, np.ndarray]],
+    ) -> List[InferenceResult]:
         """Run inference on a batch of inputs."""
-        results = []
-        for i in range(0, len(batch_inputs), batch_size):
-            batch = batch_inputs[i:i + batch_size]
-            # Stack into batch dimension
-            batched = {}
-            for name in self.input_names:
-                batched[name] = np.stack([inp[name] for inp in batch])
+        return [self.predict(feed) for feed in input_feed]
 
-            outputs = self.run(batched)
-            # Split batch into individual results
-            for j in range(len(batch)):
-                result = {name: outputs[name][j] for name in self.output_names}
-                results.append(result)
+    def warmup(self, input_feed: Optional[Dict[str, np.ndarray]] = None) -> None:
+        """Warm up the execution engine."""
+        feed = input_feed or self.config.input_feed
+        if feed is None:
+            logger.warning("No input_feed for warmup, skipping")
+            return
+        logger.info("Warming up with %d iterations", self.config.num_warmup)
+        for _ in range(self.config.num_warmup):
+            self._session.run(self._output_names, feed)
+        self._warmup_done = True
+        logger.info("Warmup complete")
 
-        return results
+    def benchmark(
+        self,
+        input_feed: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Dict[str, float]:
+        """Run benchmarking suite on current session."""
+        if self._session is None:
+            raise RuntimeError("Call load() before benchmark()")
 
-    def get_input_meta(self) -> list[dict]:
+        feed = input_feed or self.config.input_feed
+        if feed is None:
+            raise ValueError("No input_feed for benchmarking")
+
+        suite = BenchmarkSuite(self._session, self._output_names)
+        return suite.run(
+            input_feed=feed,
+            num_warmup=self.config.num_warmup,
+            num_iterations=self.config.num_iterations,
+        )
+
+    def get_input_info(self) -> List[Dict[str, Any]]:
         """Get model input metadata."""
         return [
             {"name": inp.name, "shape": inp.shape, "type": inp.type}
-            for inp in self.session.get_inputs()
+            for inp in self._session.get_inputs()
         ]
 
-    def get_output_meta(self) -> list[dict]:
+    def get_output_info(self) -> List[Dict[str, Any]]:
         """Get model output metadata."""
         return [
             {"name": out.name, "shape": out.shape, "type": out.type}
-            for out in self.session.get_outputs()
+            for out in self._session.get_outputs()
         ]
 
-    def get_stats(self) -> dict:
-        """Return runner statistics."""
-        stats = self._stats.copy()
-        if stats["total_runs"] > 0:
-            stats["avg_latency_ms"] = stats["total_time_ms"] / stats["total_runs"]
-        stats["provider"] = self.provider
-        stats["model"] = str(self.model_path)
-        return stats
+    @property
+    def is_loaded(self) -> bool:
+        return self._session is not None
+
+    def close(self) -> None:
+        """Release session resources."""
+        if self._session_mgr:
+            self._session_mgr.close()
+            self._session = None
+            logger.info("Session closed")
+
+    def __enter__(self) -> "ONNXRunner":
+        self.load()
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        status = "loaded" if self.is_loaded else "not loaded"
+        return f"ONNXRunner(model={self.config.model_path}, status={status})"
+
+
+def create_runner(
+    model_path: str,
+    providers: Optional[List[str]] = None,
+    **kwargs: Any,
+) -> ONNXRunner:
+    """Factory function to create a configured runner."""
+    config = RunnerConfig(
+        model_path=model_path,
+        providers=providers or ["ROCMExecutionProvider"],
+        **kwargs,
+    )
+    return ONNXRunner(config)

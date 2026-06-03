@@ -1,23 +1,12 @@
-# Python
+# Byte-compiled / optimized
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
+
+# Virtual environments
 venv/
 .venv/
-*.egg-info/
-dist/
-build/
-.eggs/
-
-# Models
-*.onnx
-models/
-
-# Benchmarks
-results/
-benchmark_results/
+env/
 
 # IDE
 .vscode/
@@ -25,14 +14,35 @@ benchmark_results/
 *.swp
 *.swo
 
+# Build
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ONNX models (large files)
+models/*.onnx
+*.onnx
+
+# Profiling output
+*.json
+!configs/*.json
+profiles/
+onnx_profile_*
+
+# Cache
+.cache/
+*.cache
+
+# ROCm/HIP artifacts
+*.hsaco
+*.co
+
 # OS
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
-logs/
-
-# Env
-.env
-*.env.local
+# Test
+.pytest_cache/
+.coverage
+htmlcov/

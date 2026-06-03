@@ -1,0 +1,50 @@
+# ResNet-50 Inference Configuration
+# Target: AMD MI300X with ROCm
+
+model:
+  name: resnet50
+  path: models/resnet50-v1-7.onnx
+  domain: vision
+
+inference:
+  providers:
+    - ROCMExecutionProvider
+    - CPUExecutionProvider
+  device_id: 0
+  graph_optimization: ORT_ENABLE_ALL
+  thread_count: 4
+  execution_mode: ORT_SEQUENTIAL
+
+benchmark:
+  warmup_iterations: 100
+  measured_iterations: 1000
+  batch_sizes: [1, 4, 8, 16, 32, 64]
+
+input:
+  shape: [1, 3, 224, 224]
+  dtype: float32
+  data_layout: NCHW
+
+preprocessing:
+  resize: 256
+  crop: 224
+  normalize:
+    mean: [0.485, 0.456, 0.406]
+    std: [0.229, 0.224, 0.225]
+  center_crop: true
+
+postprocessing:
+  argmax: true
+  top_k: 5
+  labels_file: labels/imagenet.txt
+
+optimization:
+  constant_folding: true
+  node_fusion: true
+  layout_optimization: false
+  fp16_conversion: false
+
+profiling:
+  enabled: false
+  output_dir: profiles/resnet50/
+  export_chrome_trace: true
